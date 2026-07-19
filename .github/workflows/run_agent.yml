@@ -2,7 +2,10 @@ name: Naver Stock Agent Automation
 
 on:
   schedule:
-    # 평일(월~금) 오후 3시 40분(KST) 실행 ➔ UTC 기준 06:40
+    # 1. 월~금 아침 08:30 KST ➔ UTC 기준 전날 밤 23:30 (일~목요일 밤 지정을 위해 0-4 설정)
+    - cron: '30 23 * * 0-4'
+    
+    # 2. 월~금 오후 15:40 KST ➔ UTC 기준 당일 오전 06:40
     - cron: '40 6 * * 1-5'
   workflow_dispatch: # 수동 실행 버튼 활성화용
 
