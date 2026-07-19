@@ -1,10 +1,14 @@
 import os
 import json
+import smtplib
 import requests
 from bs4 import BeautifulSoup
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
+# 환경변수 로드
 load_dotenv()
 api_key = os.environ.get("ANTHROPIC_API_KEY")
 
@@ -14,13 +18,19 @@ if not api_key:
 
 client = Anthropic(api_key=api_key)
 
+# 1. 분석 대상 반도체 3사 정의
+STOCK_TARGETS = {
+    "005930": "삼성전자",
+    "000660": "SK하이닉스",
+    "042700": "한미반도체"
+}
+
 # -------------------------------------------------------------
-# [1단계] 네이버 페이 증권 크롤러 기능 (Tools) 구현
+# [1단계] 크롤러 및 파일 저장 기능 (Tools) 정의
 # -------------------------------------------------------------
 def get_naver_market_data(stock_code: str):
     """네이버 금융에서 국내 주식의 실시간 현재가, 전일대비 등락률 등을 크롤링하는 함수"""
     print(f"⚙️ [시스템 실행] 네이버 금융에서 종목코드 '{stock_code}' 실시간 시세 크롤링 중...")
-    
     url = f"https://finance.naver.com/item/main.naver?code={stock_code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     
@@ -33,7 +43,6 @@ def get_naver_market_data(stock_code: str):
             return json.dumps({"error": "존재하지 않는 종목코드이거나 페이지 구조가 변경되었습니다."})
         
         current_price = no_today.find("span", {"class": "blind"}).text.replace(",", "")
-        
         wrap_company = soup.find("div", {"class": "description"})
         company_name = wrap_company.find("a").text if wrap_company else "국내 주식"
         
@@ -62,7 +71,7 @@ def get_naver_market_data(stock_code: str):
         return json.dumps({"error": str(e)})
 
 def get_naver_financial_indicators(stock_code: str):
-    """네이버 금융 기업실적분석 테이블에서 주요 재무 지표(PER, PBR, ROE)를 크롤링하는 함수"""
+    """네이버 금융 기업실적분석 테이블에서 주요 재무 지표(PER, PBR, 배당수익률)를 크롤링하는 함수"""
     print(f"⚙️ [시스템 실행] 네이버 금융에서 종목코드 '{stock_code}'의 주요 재무 지표 추출 중...")
     url = f"https://finance.naver.com/item/main.naver?code={stock_code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
@@ -101,12 +110,12 @@ def get_naver_financial_indicators(stock_code: str):
 
 def save_analysis_report(filename: str, content: str):
     """최종 투자 전략 보고서를 마크다운 파일로 저장"""
-    print(f"⚙️ [시스템 실행] 로컬에 '{filename}' 국내 주식 분석 보고서 생성 완료!")
+    print(f"⚙️ [시스템 실행] 로컬에 '{filename}' 주식 분석 보고서 물리 저장 완료!")
     with open(filename, "w", encoding="utf-8") as f:
         f.write(content)
-    return json.dumps({"status": "success", "message": "파일이 올바르게 물리적 저장되었습니다."} , ensure_ascii=False)
+    return json.dumps({"status": "success", "message": "파일이 올바르게 물리적 저장되었습니다."}, ensure_ascii=False)
 
-# Anthropic Tool Spec 매핑 (인자 설명을 더 직관적으로 보완)
+# Anthropic Tool Spec 매핑
 tools_spec = [
     {
         "name": "get_naver_market_data",
@@ -125,152 +134,34 @@ tools_spec = [
             "properties": {"stock_code": {"type": "string", "description": "국내 주식 종목코드 6자리"}},
             "required": ["stock_code"]
         }
-    },
-    {
-        "name": "save_analysis_report",
-        "description": "생성된 주식 투자 제안 보고서 본문 전체를 로컬 마크다운 파일(.md)로 물리 저장합니다.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "filename": {"type": "string", "description": "저장할 파일명 (예: 삼성전자_분석보고서.md)"},
-                "content": {"type": "string", "description": "에이전트가 작성한 리포트 마크다운 본문 내용 전체 (반드시 표와 텍스트를 포함해야 함)"}
-            },
-            "required": ["filename", "content"]
-        }
     }
 ]
 
 # -------------------------------------------------------------
-# [2단계] ReAct 에이전트 구동 엔진
+# [2단계] Gmail 발송 기능 구현
 # -------------------------------------------------------------
-target_code = "005930" 
-user_request = f"현재 종목코드 '{target_code}' 주식의 실시간 시세와 PER, PBR 지표를 네이버 금융에서 크롤링해와서 정밀 분석해줘. 의견과 데이터를 엑셀 표로 깔끔하게 정리한 뒤 '국내주식_{target_code}_분석보고서.md' 파일로 저장해줘."
-
-conversation_history = [{"role": "user", "content": user_request}]
-
-models_page = client.models.list(limit=5)
-selected_model = models_page.data[0].id
-
-SYSTEM_PROMPT = """
-너는 국내 주식 시장에 정통한 여의도 증권가의 수석 애널리스트야.
-사용자가 6자리 종목코드를 주면 반드시 네이버 금융 크롤러 도구들을 사용해 '실제 실시간 데이터'를 기반으로 분석해야 해.
-
-[중요 보고 규칙]
-1. 'get_naver_market_data'와 'get_naver_financial_indicators'로 수집한 모든 수치는 엑셀 표(Markdown Table) 형식으로 이쁘게 정돈해라.
-2. 수치 분석이 끝나면 반드시 최종 추천 의견 [매수(Buy) / 보유(Hold) / 매도(Sell)] 중 하나를 근거와 함께 텍스트로 명시해라.
-3. 이 모든 표와 텍스트 분석 내용을 통째로 완성한 뒤, 마지막 단계에 'save_analysis_report' 툴을 호출해라.
-4. 'save_analysis_report'를 호출할 때, 'content' 매개변수에는 단순 파일명이 아니라 네가 방금 작성한 표와 리포트 내용 '전체'를 문자열로 주입해야 한다. 절대 'content' 자리에 빈 값이나 파일명만 넣지 마라.
-"""
-
-max_loops = 5
-loop_count = 0
-
-while loop_count < max_loops:
-    loop_count += 1
-    print(f"\n🔄 [국장 데이터 크롤링 루프 #{loop_count}] 에이전트가 네이버 금융을 스크래핑하는 중...")
-    
-    response = client.messages.create(
-        model=selected_model,
-        max_tokens=3500,
-        system=SYSTEM_PROMPT,
-        tools=tools_spec,
-        messages=conversation_history
-    )
-    
-    conversation_history.append({"role": "assistant", "content": response.content})
-    
-    tool_use_blocks = []
-    for block in response.content:
-        if block.type == "text":
-            print(f"🧠 [에이전트 생각]:\n{block.text}")
-        elif block.type == "tool_use":
-            tool_use_blocks.append(block)
-
-    if not tool_use_blocks:
-        print("\n🎯 [크롤링 및 분석 완료] 에이전트가 최종 작업을 종료했습니다.")
-        break
-        
-    tool_responses = []
-    
-    for tool_use in tool_use_blocks:
-        tool_name = tool_use.name
-        tool_input = tool_use.input
-        tool_id = tool_use.id
-        
-        if tool_name == "get_naver_market_data":
-            result_data = get_naver_market_data(stock_code=tool_input["stock_code"])
-        elif tool_name == "get_naver_financial_indicators":
-            result_data = get_naver_financial_indicators(stock_code=tool_input["stock_code"])
-        elif tool_name == "save_analysis_report":
-            filename = tool_input.get("filename", f"국내주식_{target_code}_분석보고서.md")
-            
-            # 모든 종류의 인자 유실 패턴 방어 고도화
-            content = tool_input.get("content") or tool_input.get("report_content") or tool_input.get("text")
-            
-            if not content or len(content.strip()) < 30:
-                # 만약 Claude가 또 본문을 누락시켰다면, 어시스턴트 대화 히스토리에서 가장 마지막으로 뱉었던 보고서 텍스트를 강제로 추출해 바인딩합니다.
-                print("⚠️ [시스템 감지] 에이전트가 툴 호출 인자에 본문을 누락하여 대화 히스토리에서 역추적을 시작합니다...")
-                for history in reversed(conversation_history):
-                    if history["role"] == "assistant":
-                        for b in history["content"]:
-                            if b.type == "text" and "|" in b.text: # 표가 포함된 텍스트 블록 서치
-                                content = b.text
-                                break
-                
-                # 역추적도 실패했을 때를 대비한 최종 백업
-                if not content:
-                    content = "에이전트가 보고서 본문 매핑에 실패했습니다. 이전 터미널 결과를 확인해 주세요."
-            
-            result_data = save_analysis_report(filename=filename, content=content)
-            
-        else:
-            result_data = json.dumps({"status": "error", "message": "unknown tool"})
-            
-        print(f"👀 [크롤러 수집 데이터 ({tool_name})]: {result_data}")
-        
-        tool_responses.append({
-            "type": "tool_result",
-            "tool_use_id": tool_id,
-            "content": result_data
-        })
-    
-    conversation_history.append({
-        "role": "user",
-        "content": tool_responses
-    })
-
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
 def send_gmail_report(subject, body_markdown):
-    """지정된 마크다운 보고서를 HTML로 간단히 변환하여 Gmail로 발송하는 함수"""
+    """지정된 마크다운 보고서를 HTML로 감싸서 다중 수신처를 포함해 Gmail로 발송하는 함수"""
     sender_email = os.environ.get("GMAIL_USER")
-    sender_password = os.environ.get("GMAIL_APP_PASSWORD") # 구글 앱 비밀번호
+    sender_password = os.environ.get("GMAIL_APP_PASSWORD")
     
-    # 기본 내 메일에다가, 추가 수신자 비밀값이 있다면 뒤에 콤마로 붙여주는 방식
     my_email = os.environ.get("GMAIL_USER")
     extra_emails = os.environ.get("ADDITIONAL_RECEIVERS")
-    
     receiver_email = f"{my_email}, {extra_emails}" if extra_emails else my_email
-    
-    #receiver_email = os.environ.get("GMAIL_USER") # 내 메일로 내가 받기
     
     if not sender_email or not sender_password:
         print("⚠️ [경고] Gmail 환경변수가 세팅되지 않아 메일을 발송하지 않습니다.")
         return
 
-    # 마크다운 텍스트를 이메일에서 읽기 편하게 줄바꿈 처리
-    # (더 이쁘게 보려면 간단한 HTML 변환을 거쳐도 좋습니다)
     html_content = f"""
     <html>
       <body>
-        <h2>📊 에이전트 국장 정밀 분석 보고서</h2>
-        <p>네이버 금융 실시간 스크래핑 결과입니다. VS Code나 마크다운 뷰어에 복사해 넣으시면 표가 활성화됩니다.</p>
+        <h2>📊 에이전트 반도체 3사 실시간 종합 분석 리포트</h2>
+        <p>네이버 금융 실시간 데이터 수집 및 Claude 3.5 Sonnet 연동 결과입니다.</p>
         <hr/>
-        <pre style="font-family: 'Malgun Gothic', sans-serif; white-space: pre-wrap; background-color: #f8f9fa; padding: 15px; border-radius: 5px;">
+        <div style="font-family: 'Malgun Gothic', sans-serif; white-space: pre-wrap; background-color: #f8f9fa; padding: 15px; border-radius: 5px;">
 {body_markdown}
-        </pre>
+        </div>
       </body>
     </html>
     """
@@ -285,18 +176,104 @@ def send_gmail_report(subject, body_markdown):
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(sender_email, sender_password)
-            server.sendmail(sender_email, receiver_email, msg.as_string())
-        print("📧 [알림] Gmail 분석 보고서가 성공적으로 발송되었습니다!")
+            server.sendmail(sender_email, [email.strip() for email in receiver_email.split(',')], msg.as_string())
+        print("📧 [알림] Gmail 종합 분석 보고서가 성공적으로 발송되었습니다!")
     except Exception as e:
         print(f"❌ [메일 에러] 발송 중 오류 발생: {e}")
 
-# ------ 기존 While 루프 끝나는 지점 아래에 배치 ------
-print("\n📊 ==================== [프로세스 완료] ====================")
-# content 변수에 담긴 최종 마크다운 본문을 수집하여 메일 발송 트리거
-if 'content' in locals() and content:
-    send_gmail_report(f"🚀 [에이전트 리포트] 삼성전자(005930) 실시간 데이터 분석", content)
+# -------------------------------------------------------------
+# [3단계] ReAct 에이전트 구동 엔진 및 다중 종목 순회
+# -------------------------------------------------------------
+def run_integrated_agent():
+    # 사용 중인 API 기반 동적 모델 리스트 확인 및 자동 바인딩
+    models_page = client.models.list(limit=5)
+    selected_model = models_page.data[0].id
     
-print("==============================================================")
-print("이제 VS Code에서 '국내주식_005930_분석보고서.md' 파일을 다시 클릭해 보세요!")
-print("그 상태에서 Ctrl + Shift + V 를 누르시면 완성된 실시간 표가 등장합니다.")
-print("==============================================================")
+    SYSTEM_PROMPT = """
+    너는 국내 주식 시장에 정통한 여의도 증권가의 수석 애널리스트야.
+    제공된 네이버 금융 크롤러 도구들을 사용해 종목의 '실제 실시간 데이터'와 '밸류에이션 지표'를 기반으로 분석해야 해.
+
+    [중요 보고 규칙]
+    1. 수집한 모든 수치 데이터는 가독성이 극대화되도록 반드시 '엑셀 표(Markdown Table)' 형식으로 깔끔하게 정리해라.
+    2. 데이터 분석 결과를 바탕으로 최종 투자 의견 [매수(Buy) / 보유(Hold) / 매도(Sell)] 중 하나를 강력한 근거와 함께 텍스트로 명시해라.
+    3. 전문적인 수석 애널리스트 수준의 간결하고 핵심적인 한 줄 평 인사이트를 포함해라.
+    """
+    
+    combined_reports = ""
+    
+    # 순차적으로 3개 반도체 종목 루프 실행
+    for stock_code, stock_name in STOCK_TARGETS.items():
+        print(f"\n🔄 [종목 분석 시작] {stock_name}({stock_code}) 분석 루프 기동...")
+        
+        user_request = f"현재 '{stock_name}(종목코드: {stock_code})' 주식의 실시간 시세와 PER, PBR 지표를 도구를 통해 크롤링해와서 정밀 분석해줘. 분석 결과를 엑셀 표 스타일로 일목요연하게 정리해 줘."
+        conversation_history = [{"role": "user", "content": user_request}]
+        
+        max_loops = 4
+        loop_count = 0
+        single_report = ""
+        
+        while loop_count < max_loops:
+            loop_count += 1
+            response = client.messages.create(
+                model=selected_model,
+                max_tokens=2500,
+                system=SYSTEM_PROMPT,
+                tools=tools_spec,
+                messages=conversation_history
+            )
+            
+            conversation_history.append({"role": "assistant", "content": response.content})
+            
+            tool_use_blocks = [block for block in response.content if block.type == "tool_use"]
+            text_blocks = [block for block in response.content if block.type == "text"]
+            
+            for block in text_blocks:
+                if "|" in block.text or "투자 의견" in block.text:
+                    single_report = block.text
+            
+            if not tool_use_blocks:
+                break
+                
+            tool_responses = []
+            for tool_use in tool_use_blocks:
+                tool_name = tool_use.name
+                tool_input = tool_use.input
+                tool_id = tool_use.id
+                
+                if tool_name == "get_naver_market_data":
+                    result_data = get_naver_market_data(stock_code=tool_input["stock_code"])
+                elif tool_name == "get_naver_financial_indicators":
+                    result_data = get_naver_financial_indicators(stock_code=tool_input["stock_code"])
+                else:
+                    result_data = json.dumps({"status": "error", "message": "unknown tool"})
+                    
+                print(f"👀 [크롤러 데이터 확보 ({tool_name})]: {result_data}")
+                
+                tool_responses.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": result_data
+                })
+            
+            conversation_history.append({
+                "role": "user",
+                "content": tool_responses
+            })
+            
+        # 단일 종목 결과 누적
+        combined_reports += f"\n## 📈 {stock_name} ({stock_code}) 종합 분석 보고서\n"
+        combined_reports += single_report if single_report else "보고서 생성 실패"
+        combined_reports += "\n\n<hr style='border: 1px dashed #bbb;' />\n"
+
+    # [4단계] 종합 결과 처리 (로컬 물리 파일 저장 및 Gmail 단 한 통으로 결합 발송)
+    if combined_reports:
+        print("\n📊 ==================== [종합 데이터 가공 및 전송] ====================")
+        # 1. 로컬 마크다운 파일로 물리적 저장 완료
+        save_analysis_report("반도체3사_종합분석보고서.md", combined_reports)
+        
+        # 2. 통합 리포트를 Gmail로 최종 전송
+        send_gmail_report("🚀 [에이전트 리포트] 반도체 3사(삼전/하이닉스/한미) 실시간 종합 분석", combined_reports)
+        print("==============================================================")
+
+if __name__ == "__main__":
+    run_integrated_agent()
