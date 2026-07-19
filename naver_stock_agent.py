@@ -247,7 +247,14 @@ def send_gmail_report(subject, body_markdown):
     """지정된 마크다운 보고서를 HTML로 간단히 변환하여 Gmail로 발송하는 함수"""
     sender_email = os.environ.get("GMAIL_USER")
     sender_password = os.environ.get("GMAIL_APP_PASSWORD") # 구글 앱 비밀번호
-    receiver_email = os.environ.get("GMAIL_USER") # 내 메일로 내가 받기
+    
+    # 기본 내 메일에다가, 추가 수신자 비밀값이 있다면 뒤에 콤마로 붙여주는 방식
+    my_email = os.environ.get("GMAIL_USER")
+    extra_emails = os.environ.get("ADDITIONAL_RECEIVERS")
+    
+    receiver_email = f"{my_email}, {extra_emails}" if extra_emails else my_email
+    
+    #receiver_email = os.environ.get("GMAIL_USER") # 내 메일로 내가 받기
     
     if not sender_email or not sender_password:
         print("⚠️ [경고] Gmail 환경변수가 세팅되지 않아 메일을 발송하지 않습니다.")
